@@ -40,6 +40,7 @@
 
 import os
 import pyspark.sql.functions as F
+from pyspark.sql import SparkSession
 from dotenv import load_dotenv
 
 # COMMAND ----------
@@ -48,11 +49,13 @@ load_dotenv()
 
 # COMMAND ----------
 
-# Setting Spark Conf with the Neo4j endpoints
-spark.conf.set('neo4j.url', os.getenv('NEO4J_URL'))
-spark.conf.set('neo4j.authentication.basic.username', os.getenv('NEO4J_USER'))
-spark.conf.set('neo4j.authentication.basic.password', os.getenv('NEO4J_PASSWORD'))
-spark.conf.set('neo4j.authentication.type', 'basic')
+spark = (
+    SparkSession.builder.config("neo4j.url", url)
+    .config("neo4j.authentication.basic.username", username)
+    .config("neo4j.authentication.basic.password", password)
+    .config("neo4j.database", dbname)
+    .getOrCreate()
+)
 
 # COMMAND ----------
 
@@ -97,21 +100,21 @@ for node in nodes:
 # COMMAND ----------
 
 # Query to get the list of tables in the specified catalog and database
+formatted_rel_tables = [s.replace('-', '_') for s in rel_tables]
+
 relationships = (
   spark
     .sql(f'show tables in {catalog_name}.default')
-    # Filter the tables to include only those in the rel_tables list
-    .where(F.col('tableName').isin(list(rel_tables)))
-    # Select only the tableName column
+    .where(F.col('tableName').isin(list(formatted_rel_tables)))
     .select('tableName')
-    # Collect the results into a list of Row objects
     .collect()
 )
 
 # COMMAND ----------
 
 # Define the regular expression pattern for extracting foreign key information
-regexpr = F.lit(f'FOREIGN KEY \\(`(.*)`\\) REFERENCES `{catalog_name}`\\.`default`\\.`(.*)` \\(`(.*)`\\)')
+# Define the regular expression pattern for extracting foreign key information
+regexpr = r"FOREIGN\s+KEY\s*\(`([^`]+)`\)\s*REFERENCES\s*(?:`[^`]+`\.)?(?:`[^`]+`\.)?`([^`]+)`\s*\(`([^`]+)`\)"
 datatype_col = F.col('data_type')
 
 # Iterate over each relationship table
@@ -119,53 +122,58 @@ for rel in relationships:
   # Extract foreign key information for the current table
   table_fks = ( 
     spark
-      .sql(f'describe table extended {catalog_name}.default.`{rel.tableName}`')
+      .sql(f'describe table extended {catalog_name}.dbx_genai_bloodhound_demo.`{rel.tableName}`')
       .where("col_name like '%_fk'")
       .select(
-        F.regexp_extract_all(datatype_col, regexpr, F.lit(1)).getItem(0).alias('table_col'),
-        F.regexp_extract_all(datatype_col, regexpr, F.lit(2)).getItem(0).alias('fk_table_name'),
-        F.regexp_extract_all(datatype_col, regexpr, F.lit(3)).getItem(0).alias('fk_table_col')
-      )
+        F.regexp_extract('data_type', regexpr, 1).alias('table_col'),
+        F.regexp_extract('data_type', regexpr, 2).alias('fk_table_name'),
+        F.regexp_extract('data_type', regexpr, 3).alias('fk_table_col')
+    )
       .collect()
   )
   
-  # Extract the relationship name from the table name
-  rel_name = rel.tableName.split("-")[1]
-  
-  # Initialize variables for source and target labels and keys
-  for table_fk in table_fks:
-    if table_fk.table_col.startswith('source_'):
-      source_label = table_fk.fk_table_name
-      source_key = f'{table_fk.table_col}:{table_fk.fk_table_col}'
-    else:
-      target_label = table_fk.fk_table_name
-      target_key = f'{table_fk.table_col}:{table_fk.fk_table_col}'
-  
-  # Print the relationship details for debugging purposes
-  print(f'''
-  For table {rel.tableName} we have:
-  - source_label: {source_label}
-  - source_key: {source_key}
-  - target_label: {target_label}
-  - target_key: {target_key}
-  - relationship name: {rel_name}
-  ''')
-  
-  # Read the relationship table data and write it to Neo4j with the appropriate options
-  (
-    spark.read
-      .table(f'{catalog_name}.default.`{rel.tableName}`')
-      .coalesce(1)
-      .write
-      .mode("overwrite")
-      .format("org.neo4j.spark.DataSource")
-      .option("relationship", rel_name.upper())
-      .option("relationship.save.strategy", "keys")
-      .option("relationship.source.labels", source_label)
-      .option("relationship.source.save.mode", "Match")
-      .option("relationship.source.node.keys", source_key)
-      .option("relationship.target.labels", target_label)
-      .option("relationship.target.save.mode", "Match")
-      .option("relationship.target.node.keys", target_key)
-      .save()
-  )
+  if table_fks:
+    # Extract the relationship name from the table name
+    rel_name = rel.tableName.split("_")[0]
+    
+    # Initialize variables for source and target labels and keys
+    for table_fk in table_fks:
+      if table_fk.table_col.startswith('source_'):
+        source_label = table_fk.fk_table_name
+        source_key = f'{table_fk.table_col}:{table_fk.fk_table_col}'
+
+        (
+        spark.read
+          .table(f'{catalog_name}.dbx_genai_bloodhound_demo.`{rel.tableName}`')
+          .coalesce(1)
+          .write
+          .mode("overwrite")
+          .format("org.neo4j.spark.DataSource")
+          .option("relationship", rel_name.upper())
+          .option("relationship.save.strategy", "keys")
+          .option("relationship.source.labels", source_label)
+          .option("relationship.source.save.mode", "Match")
+          .option("relationship.source.node.keys", source_key)
+          .save()
+        )
+      else:
+        target_label = table_fk.fk_table_name
+        target_key = f'{table_fk.table_col}:{table_fk.fk_table_col}'
+
+        (
+        spark.read
+          .table(f'{catalog_name}.dbx_genai_bloodhound_demo.`{rel.tableName}`')
+          .coalesce(1)
+          .write
+          .mode("overwrite")
+          .format("org.neo4j.spark.DataSource")
+          .option("relationship", rel_name.upper())
+          .option("relationship.save.strategy", "keys")
+          .option("relationship.target.labels", target_label)
+          .option("relationship.target.save.mode", "Match")
+          .option("relationship.target.node.keys", target_key)
+          .save()
+        ) 
+  else:
+    print(f'No foreign keys found for table {rel.tableName}')
+    continue
